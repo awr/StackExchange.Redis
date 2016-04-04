@@ -1,4 +1,6 @@
-﻿using System.Threading.Tasks;
+﻿using System;
+using System.Linq;
+using System.Threading.Tasks;
 using NUnit.Framework;
 
 namespace StackExchange.Redis.Tests
@@ -207,6 +209,472 @@ namespace StackExchange.Redis.Tests
             }
         }
 
+        [Test]
+        [TestCase(false, false, true)]
+        [TestCase(false, true, false)]
+        [TestCase(true, false, false)]
+        [TestCase(true, true, true)]
+        public void BasicTranWithListExistsCondition(bool demandKeyExists, bool keyExists, bool expectTran)
+        {
+            using (var muxer = Create(disabledCommands: new[] { "info", "config" }))
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+                if (keyExists) db.ListRightPush(key2, "any value", flags:  CommandFlags.FireAndForget);
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(keyExists, db.KeyExists(key2));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(demandKeyExists ? Condition.ListIndexExists(key2, 0) : Condition.ListIndexNotExists(key2, 0));
+                var push = tran.ListRightPushAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.ListGetByIndex(key, 0);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+                if (demandKeyExists == keyExists)
+                {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(1, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value", (string)get, "eq: get");
+                }
+                else
+                {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(null, (string)get, "neq: get");
+                }
+            }
+        }
+
+        [Test]
+        [TestCase("same", "same", true, true)]
+        [TestCase("x", "y", true, false)]
+        [TestCase("x", null, true, false)]
+        [TestCase(null, "y", true, false)]
+        [TestCase(null, null, true, true)]
+
+        [TestCase("same", "same", false, false)]
+        [TestCase("x", "y", false, true)]
+        [TestCase("x", null, false, true)]
+        [TestCase(null, "y", false, true)]
+        [TestCase(null, null, false, false)]
+        public void BasicTranWithListEqualsCondition(string expected, string value, bool expectEqual, bool expectTran)
+        {
+            using (var muxer = Create())
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+
+                if (value != null) db.ListRightPush(key2, value, flags: CommandFlags.FireAndForget);
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(value, (string)db.ListGetByIndex(key2, 0));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(expectEqual ? Condition.ListIndexEqual(key2, 0, expected) : Condition.ListIndexNotEqual(key2, 0, expected));
+                var push = tran.ListRightPushAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.ListGetByIndex(key, 0);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+                if (expectEqual == (value == expected))
+                {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(1, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value", (string)get, "eq: get");
+                }
+                else
+                {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(null, (string)get, "neq: get");
+                }
+            }
+        }
+
+        public enum ComparisonType
+        {
+            Equal,
+            LessThan,
+            GreaterThan
+        }
+
+        [Test]
+        [TestCase("five", ComparisonType.Equal, 5L, false)]
+        [TestCase("four", ComparisonType.Equal, 4L, true)]
+        [TestCase("three", ComparisonType.Equal, 3L, false)]
+        [TestCase("", ComparisonType.Equal, 2L, false)]
+        [TestCase("", ComparisonType.Equal, 0L, true)]
+        [TestCase(null, ComparisonType.Equal, 1L, false)]
+        [TestCase(null, ComparisonType.Equal, 0L, true)]
+
+        [TestCase("five", ComparisonType.LessThan, 5L, true)]
+        [TestCase("four", ComparisonType.LessThan, 4L, false)]
+        [TestCase("three", ComparisonType.LessThan, 3L, false)]
+        [TestCase("", ComparisonType.LessThan, 2L, true)]
+        [TestCase("", ComparisonType.LessThan, 0L, false)]
+        [TestCase(null, ComparisonType.LessThan, 1L, true)]
+        [TestCase(null, ComparisonType.LessThan, 0L, false)]
+
+        [TestCase("five", ComparisonType.GreaterThan, 5L, false)]
+        [TestCase("four", ComparisonType.GreaterThan, 4L, false)]
+        [TestCase("three", ComparisonType.GreaterThan, 3L, true)]
+        [TestCase("", ComparisonType.GreaterThan, 2L, false)]
+        [TestCase("", ComparisonType.GreaterThan, 0L, false)]
+        [TestCase(null, ComparisonType.GreaterThan, 1L, false)]
+        [TestCase(null, ComparisonType.GreaterThan, 0L, false)]
+        public void BasicTranWithStringLengthCondition(string value, ComparisonType type, long length, bool expectTran)
+        {
+            using (var muxer = Create())
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+
+                var expectSuccess = false;
+                Condition condition = null;
+                var valueLength = value?.Length ?? 0;
+                switch (type) {
+                    case ComparisonType.Equal:
+                        expectSuccess = valueLength == length;
+                        condition = Condition.StringLengthEqual(key2, length);
+                        break;
+                    case ComparisonType.GreaterThan:
+                        expectSuccess = valueLength > length;
+                        condition = Condition.StringLengthGreaterThan(key2, length);
+                        break;
+                    case ComparisonType.LessThan:
+                        expectSuccess = valueLength < length;
+                        condition = Condition.StringLengthLessThan(key2, length);
+                        break;
+                }
+
+                if (value != null) db.StringSet(key2, value, flags: CommandFlags.FireAndForget);
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(value, (string)db.StringGet(key2));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(condition);
+                var push = tran.StringSetAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.StringLength(key);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+
+                if (expectSuccess) {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(true, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value".Length, get, "eq: get");
+                } else {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(0, get, "neq: get");
+                }
+            }
+        }
+
+        [Test]
+        [TestCase("five", ComparisonType.Equal, 5L, false)]
+        [TestCase("four", ComparisonType.Equal, 4L, true)]
+        [TestCase("three", ComparisonType.Equal, 3L, false)]
+        [TestCase("", ComparisonType.Equal, 2L, false)]
+        [TestCase("", ComparisonType.Equal, 0L, true)]
+        
+        [TestCase("five", ComparisonType.LessThan, 5L, true)]
+        [TestCase("four", ComparisonType.LessThan, 4L, false)]
+        [TestCase("three", ComparisonType.LessThan, 3L, false)]
+        [TestCase("", ComparisonType.LessThan, 2L, true)]
+        [TestCase("", ComparisonType.LessThan, 0L, false)]
+
+        [TestCase("five", ComparisonType.GreaterThan, 5L, false)]
+        [TestCase("four", ComparisonType.GreaterThan, 4L, false)]
+        [TestCase("three", ComparisonType.GreaterThan, 3L, true)]
+        [TestCase("", ComparisonType.GreaterThan, 2L, false)]
+        [TestCase("", ComparisonType.GreaterThan, 0L, false)]
+        public void BasicTranWithHashLengthCondition(string value, ComparisonType type, long length, bool expectTran)
+        {
+            using (var muxer = Create())
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+
+                var expectSuccess = false;
+                Condition condition = null;
+                var valueLength = value?.Length ?? 0;
+                switch (type) {
+                    case ComparisonType.Equal:
+                        expectSuccess = valueLength == length;
+                        condition = Condition.HashLengthEqual(key2, length);
+                        break;
+                    case ComparisonType.GreaterThan:
+                        expectSuccess = valueLength > length;
+                        condition = Condition.HashLengthGreaterThan(key2, length);
+                        break;
+                    case ComparisonType.LessThan:
+                        expectSuccess = valueLength < length;
+                        condition = Condition.HashLengthLessThan(key2, length);
+                        break;
+                }
+
+                for (var i = 0; i < valueLength; i++) {
+                    db.HashSet(key2, i, value[i].ToString(), flags: CommandFlags.FireAndForget);
+                }
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(valueLength, db.HashLength(key2));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(condition);
+                var push = tran.StringSetAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.StringLength(key);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+
+                if (expectSuccess) {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(true, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value".Length, get, "eq: get");
+                } else {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(0, get, "neq: get");
+                }
+            }
+        }
+        
+        [Test]
+        [TestCase("five", ComparisonType.Equal, 5L, false)]
+        [TestCase("four", ComparisonType.Equal, 4L, true)]
+        [TestCase("three", ComparisonType.Equal, 3L, false)]
+        [TestCase("", ComparisonType.Equal, 2L, false)]
+        [TestCase("", ComparisonType.Equal, 0L, true)]
+        
+        [TestCase("five", ComparisonType.LessThan, 5L, true)]
+        [TestCase("four", ComparisonType.LessThan, 4L, false)]
+        [TestCase("three", ComparisonType.LessThan, 3L, false)]
+        [TestCase("", ComparisonType.LessThan, 2L, true)]
+        [TestCase("", ComparisonType.LessThan, 0L, false)]
+
+        [TestCase("five", ComparisonType.GreaterThan, 5L, false)]
+        [TestCase("four", ComparisonType.GreaterThan, 4L, false)]
+        [TestCase("three", ComparisonType.GreaterThan, 3L, true)]
+        [TestCase("", ComparisonType.GreaterThan, 2L, false)]
+        [TestCase("", ComparisonType.GreaterThan, 0L, false)]
+        public void BasicTranWithSetCardinalityCondition(string value, ComparisonType type, long length, bool expectTran)
+        {
+            using (var muxer = Create())
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+
+                var expectSuccess = false;
+                Condition condition = null;
+                var valueLength = value?.Length ?? 0;
+                switch (type) {
+                    case ComparisonType.Equal:
+                        expectSuccess = valueLength == length;
+                        condition = Condition.SetLengthEqual(key2, length);
+                        break;
+                    case ComparisonType.GreaterThan:
+                        expectSuccess = valueLength > length;
+                        condition = Condition.SetLengthGreaterThan(key2, length);
+                        break;
+                    case ComparisonType.LessThan:
+                        expectSuccess = valueLength < length;
+                        condition = Condition.SetLengthLessThan(key2, length);
+                        break;
+                }
+
+                for (var i = 0; i < valueLength; i++) {
+                    db.SetAdd(key2, i, flags: CommandFlags.FireAndForget);
+                }
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(valueLength, db.SetLength(key2));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(condition);
+                var push = tran.StringSetAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.StringLength(key);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+
+                if (expectSuccess) {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(true, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value".Length, get, "eq: get");
+                } else {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(0, get, "neq: get");
+                }
+            }
+        }
+
+        [Test]
+        [TestCase("five", ComparisonType.Equal, 5L, false)]
+        [TestCase("four", ComparisonType.Equal, 4L, true)]
+        [TestCase("three", ComparisonType.Equal, 3L, false)]
+        [TestCase("", ComparisonType.Equal, 2L, false)]
+        [TestCase("", ComparisonType.Equal, 0L, true)]
+        
+        [TestCase("five", ComparisonType.LessThan, 5L, true)]
+        [TestCase("four", ComparisonType.LessThan, 4L, false)]
+        [TestCase("three", ComparisonType.LessThan, 3L, false)]
+        [TestCase("", ComparisonType.LessThan, 2L, true)]
+        [TestCase("", ComparisonType.LessThan, 0L, false)]
+
+        [TestCase("five", ComparisonType.GreaterThan, 5L, false)]
+        [TestCase("four", ComparisonType.GreaterThan, 4L, false)]
+        [TestCase("three", ComparisonType.GreaterThan, 3L, true)]
+        [TestCase("", ComparisonType.GreaterThan, 2L, false)]
+        [TestCase("", ComparisonType.GreaterThan, 0L, false)]
+        public void BasicTranWithSortedSetCardinalityCondition(string value, ComparisonType type, long length, bool expectTran)
+        {
+            using (var muxer = Create())
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+
+                var expectSuccess = false;
+                Condition condition = null;
+                var valueLength = value?.Length ?? 0;
+                switch (type) {
+                    case ComparisonType.Equal:
+                        expectSuccess = valueLength == length;
+                        condition = Condition.SortedSetLengthEqual(key2, length);
+                        break;
+                    case ComparisonType.GreaterThan:
+                        expectSuccess = valueLength > length;
+                        condition = Condition.SortedSetLengthGreaterThan(key2, length);
+                        break;
+                    case ComparisonType.LessThan:
+                        expectSuccess = valueLength < length;
+                        condition = Condition.SortedSetLengthLessThan(key2, length);
+                        break;
+                }
+
+                for (var i = 0; i < valueLength; i++) {
+                    db.SortedSetAdd(key2, i, i, flags: CommandFlags.FireAndForget);
+                }
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(valueLength, db.SortedSetLength(key2));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(condition);
+                var push = tran.StringSetAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.StringLength(key);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+
+                if (expectSuccess) {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(true, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value".Length, get, "eq: get");
+                } else {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(0, get, "neq: get");
+                }
+            }
+        }
+
+        [Test]
+        [TestCase("five", ComparisonType.Equal, 5L, false)]
+        [TestCase("four", ComparisonType.Equal, 4L, true)]
+        [TestCase("three", ComparisonType.Equal, 3L, false)]
+        [TestCase("", ComparisonType.Equal, 2L, false)]
+        [TestCase("", ComparisonType.Equal, 0L, true)]
+        
+        [TestCase("five", ComparisonType.LessThan, 5L, true)]
+        [TestCase("four", ComparisonType.LessThan, 4L, false)]
+        [TestCase("three", ComparisonType.LessThan, 3L, false)]
+        [TestCase("", ComparisonType.LessThan, 2L, true)]
+        [TestCase("", ComparisonType.LessThan, 0L, false)]
+
+        [TestCase("five", ComparisonType.GreaterThan, 5L, false)]
+        [TestCase("four", ComparisonType.GreaterThan, 4L, false)]
+        [TestCase("three", ComparisonType.GreaterThan, 3L, true)]
+        [TestCase("", ComparisonType.GreaterThan, 2L, false)]
+        [TestCase("", ComparisonType.GreaterThan, 0L, false)]
+        public void BasicTranWithListLengthCondition(string value, ComparisonType type, long length, bool expectTran)
+        {
+            using (var muxer = Create())
+            {
+                RedisKey key = Me(), key2 = Me() + "2";
+                var db = muxer.GetDatabase();
+                db.KeyDelete(key, CommandFlags.FireAndForget);
+                db.KeyDelete(key2, CommandFlags.FireAndForget);
+
+                var expectSuccess = false;
+                Condition condition = null;
+                var valueLength = value?.Length ?? 0;
+                switch (type) {
+                    case ComparisonType.Equal:
+                        expectSuccess = valueLength == length;
+                        condition = Condition.ListLengthEqual(key2, length);
+                        break;
+                    case ComparisonType.GreaterThan:
+                        expectSuccess = valueLength > length;
+                        condition = Condition.ListLengthGreaterThan(key2, length);
+                        break;
+                    case ComparisonType.LessThan:
+                        expectSuccess = valueLength < length;
+                        condition = Condition.ListLengthLessThan(key2, length);
+                        break;
+                }
+
+                for (var i = 0; i < valueLength; i++) {
+                    db.ListRightPush(key2, i, flags: CommandFlags.FireAndForget);
+                }
+                Assert.IsFalse(db.KeyExists(key));
+                Assert.AreEqual(valueLength, db.ListLength(key2));
+
+                var tran = db.CreateTransaction();
+                var cond = tran.AddCondition(condition);
+                var push = tran.StringSetAsync(key, "any value");
+                var exec = tran.ExecuteAsync();
+                var get = db.StringLength(key);
+
+                Assert.AreEqual(expectTran, db.Wait(exec), "expected tran result");
+
+                if (expectSuccess) {
+                    Assert.IsTrue(db.Wait(exec), "eq: exec");
+                    Assert.IsTrue(cond.WasSatisfied, "eq: was satisfied");
+                    Assert.AreEqual(true, db.Wait(push), "eq: push");
+                    Assert.AreEqual("any value".Length, get, "eq: get");
+                } else {
+                    Assert.IsFalse(db.Wait(exec), "neq: exec");
+                    Assert.False(cond.WasSatisfied, "neq: was satisfied");
+                    Assert.AreEqual(TaskStatus.Canceled, push.Status, "neq: push");
+                    Assert.AreEqual(0, get, "neq: get");
+                }
+            }
+        }
+        
         [Test]
         public async void BasicTran()
         {
